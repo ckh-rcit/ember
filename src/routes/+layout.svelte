@@ -32,6 +32,6 @@
 
 	<footer class="muted" style="margin-top: 0.7rem; text-align: center;">
 		&copy; {currentYear} Chris K. Harris ·
-		<a href="https://github.com/ckh-rcit" target="_blank" rel="noreferrer">GitHub</a>
+		<a href="https://github.com/ckh-rcit/ember" target="_blank" rel="noreferrer">GitHub</a>
 	</footer>
 </div>
