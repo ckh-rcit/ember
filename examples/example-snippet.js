@@ -3,7 +3,8 @@ export default {
     const requestURL = new URL(request.url);
     const path = requestURL.pathname;
 
-    // === List of all paths that need to be redirected ===
+    const siteHostname = "capriverside.org";
+
     const archivePaths = new Set([
       "/sites/g/files/aldnop136/files/2024-01/Taxpayer%20Consent%20-%20F14446_ENG.pdf",
       "/sites/g/files/aldnop136/files/2024-01/VITA%20Fall%20Ads.pdf",
@@ -25,17 +26,13 @@ export default {
       "/sites/g/files/aldnop136/files/2022-09/2017%20Annual%20Report.pdf",
       "/sites/g/files/aldnop136/files/2022-09/2018%20Annual%20Report.pdf",
       "/sites/g/files/aldnop136/files/2022-09/2019%20Annual%20Report_0.pdf",
-      "/sites/g/files/aldnop136/files/2022-09/2020%20ANNUAL%20REPORT_0.pdf"
+      "/sites/g/files/aldnop136/files/2022-09/2020%20ANNUAL%20REPORT_0.pdf",
     ]);
 
-    if (archivePaths.has(path) && !requestURL.searchParams.has('archive-consent')) {
-      const archiveUrl = `https://capriverside.org/archive-notice?archive-url=${encodeURIComponent(requestURL.href)}`;
+    if (archivePaths.has(path) && !requestURL.searchParams.has("archive-consent")) {
+      const archiveUrl =
+        "https://" + siteHostname + "/archive-notice?archive-url=" + encodeURIComponent(requestURL.href);
       return Response.redirect(archiveUrl, 301);
-    }
-
-    const location = redirectMap.get(path);
-    if (location) {
-      return Response.redirect(location, 301);
     }
 
     return fetch(request);

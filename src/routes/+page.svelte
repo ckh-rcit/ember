@@ -463,6 +463,28 @@
 		}
 	}
 
+	async function toggleRuleEnabled(index: number): Promise<void> {
+		const entry = mergedSnippets[index];
+		if (!entry?.rule) return;
+		entry.rule.enabled = !entry.rule.enabled;
+		try {
+			const rulesToSave = mergedSnippets
+				.filter((m) => m.rule)
+				.map((m) => m.rule!);
+			const res = await fetch(`/api/zones/${selectedZoneId}/snippets/rules`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ rules: rulesToSave })
+			});
+			const data = (await res.json()) as RulesResponse;
+			if (!res.ok) throw new Error(data.error || 'Failed to update rule');
+			snippetRules = data.rules ?? rulesToSave;
+		} catch (error) {
+			entry.rule.enabled = !entry.rule.enabled;
+			showToast('error', error instanceof Error ? error.message : 'Failed to toggle rule');
+		}
+	}
+
 	function requestDelete(name: string): void {
 		deleteConfirmName = name;
 	}
@@ -878,7 +900,8 @@
 									<label class="toggle" onclick={(e) => e.stopPropagation()}>
 										<input
 											type="checkbox"
-											bind:checked={entry.rule.enabled}
+											checked={entry.rule.enabled}
+											onchange={() => toggleRuleEnabled(i)}
 										/>
 										<span class="toggle-slider"></span>
 									</label>
