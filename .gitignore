@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+.svelte-kit/
+.wrangler/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Lock files (bun)
+bun.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# Generated types
+worker-configuration.d.ts
