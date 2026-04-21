@@ -358,6 +358,8 @@
 	async function loadSnippetsAndRules(): Promise<void> {
 		if (!selectedZoneId) return;
 		busy = true;
+		mergedSnippets = [];
+		snippetRules = [];
 		try {
 			const [snippetsRes, rulesRes] = await Promise.all([
 				fetch(`/api/zones/${selectedZoneId}/snippets`),
@@ -809,7 +811,26 @@
 
 	<!-- ─── Manage Tab ──────────────────────────────── -->
 	{#if activeTab === 'manage'}
-		{#if mergedSnippets.length === 0 && !busy}
+		{#if busy}
+			<div class="skeleton-table">
+				<div class="skeleton-row skeleton-header">
+					<div class="skeleton-cell" style="width: 24%;"></div>
+					<div class="skeleton-cell" style="width: 30%;"></div>
+					<div class="skeleton-cell" style="width: 10%;"></div>
+					<div class="skeleton-cell" style="width: 16%;"></div>
+					<div class="skeleton-cell" style="width: 20%;"></div>
+				</div>
+				{#each { length: 3 } as _}
+					<div class="skeleton-row">
+						<div class="skeleton-cell" style="width: 24%;"></div>
+						<div class="skeleton-cell" style="width: 30%;"></div>
+						<div class="skeleton-cell" style="width: 10%;"></div>
+						<div class="skeleton-cell" style="width: 16%;"></div>
+						<div class="skeleton-cell" style="width: 20%;"></div>
+					</div>
+				{/each}
+			</div>
+		{:else if mergedSnippets.length === 0}
 			<p class="muted" style="text-align: center; padding: 1.5rem 0;">
 				{#if selectedZoneId}
 					No snippets found for this zone.
