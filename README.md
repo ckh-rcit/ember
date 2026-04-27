@@ -6,32 +6,30 @@ Ember provides full CRUD operations for snippets and snippet rules across all zo
 
 ## Features
 
-- **Zone management** -- Browse and select from all zones in your Cloudflare account
-- **Snippet CRUD** -- Create, view, edit, rename, and delete snippets
-- **Code editor** -- Integrated CodeMirror 6 editor with JavaScript syntax highlighting
-- **Rule expression builder** -- Visual field/operator/value builder or raw expression editing
-- **Import/Export** -- Bulk import and export snippets as JSON, or export individual snippets as `.js` files
-- **Dark theme** -- Purpose-built dark interface with orange-amber accent
+- Browse and select from all zones in your Cloudflare account
+- Create, view, edit, rename, and delete snippets
+- Integrated CodeMirror 6 editor with JavaScript syntax highlighting
+- Visual field/operator/value rule expression builder or raw expression editing
+- Bulk import and export snippets as JSON, or export individual snippets as `.js` files
 
 ## Tech Stack
 
-- [SvelteKit](https://svelte.dev/) (Svelte 5, runes mode)
-- [Tailwind CSS](https://tailwindcss.com/) v4
-- [CodeMirror](https://codemirror.net/) 6
-- [Cloudflare Pages](https://pages.cloudflare.com/) via `@sveltejs/adapter-cloudflare`
-- [Bun](https://bun.sh/) as package manager and runtime
+- SvelteKit 2 with Svelte 5 (runes mode)
+- Tailwind CSS 4
+- CodeMirror 6
+- TypeScript
+- Cloudflare Pages
 
 ## Prerequisites
 
-- [Bun](https://bun.sh/) >= 1.3
-- A Cloudflare API token with **Snippets Write** and **Zone Read** permissions
+- [Bun](https://bun.sh/) 1.3 or later
+- A Cloudflare API token (see [API Token Permissions](#api-token-permissions))
 
 ## Setup
 
-1. Clone the repository and install dependencies:
+1. Install dependencies:
 
    ```sh
-   cd ember
    bun install
    ```
 
@@ -49,50 +47,43 @@ Ember provides full CRUD operations for snippets and snippet rules across all zo
 
 ## Deployment
 
-Ember is configured to deploy as a Cloudflare Pages project.
+Build and deploy to Cloudflare Pages:
 
 ```sh
 bun run build
-```
-
-The build output is written to `.svelte-kit/cloudflare/`. Deploy via Wrangler:
-
-```sh
 wrangler pages deploy .svelte-kit/cloudflare
 ```
 
-Set the `CLOUDFLARE_API_TOKEN` secret in your Pages project:
+Set the API token secret in your Pages project:
 
 ```sh
 wrangler pages secret put CLOUDFLARE_API_TOKEN
 ```
+
+## API Token Permissions
+
+| Permission | Access |
+| ---------- | ------ |
+| Zone       | Read   |
+| Snippets   | Write  |
 
 ## Project Structure
 
 ```
 src/
   lib/
-    cloudflare.ts        # Cloudflare API client (zones, snippets, rules)
+    cloudflare.ts        # Cloudflare API client
     types.ts             # TypeScript interfaces
     components/
       CodeEditor.svelte  # CodeMirror 6 wrapper component
   routes/
-    +page.svelte         # Main SPA (manage + create tabs)
-    +layout.svelte       # App shell and header
-    layout.css           # Global dark theme styles
+    +page.svelte         # Main application page
+    +layout.svelte       # App shell and layout
+    layout.css           # Global styles
     api/                 # Server-side API proxy routes
-      zones/             # Zone listing
-      zones/[zoneId]/
-        snippets/        # Snippet CRUD endpoints
-        snippets/rules/  # Snippet rule endpoints
 ```
 
-## API Token Permissions
+## License
 
-The Cloudflare API token used by Ember requires the following permissions:
-
-| Permission     | Access |
-| -------------- | ------ |
-| Zone           | Read   |
-| Snippets       | Write  |
+MIT
 
