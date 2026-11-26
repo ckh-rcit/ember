@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import CodeEditor from '$lib/components/CodeEditor.svelte';
 	import type { Snippet, SnippetRule, ZoneSummary, EmberExportPayload, SnippetExport } from '$lib/types';
 
@@ -127,10 +127,14 @@
 	interface MergedSnippet {
 		snippet: Snippet;
 		rule?: SnippetRule;
+		ruleSnapshot: string;
 		code: string;
+		savedCode: string;
 		codeLoaded: boolean;
-		codeModified: boolean;
+		codeLoading: boolean;
 		expanded: boolean;
+		saving: boolean;
+		savedAt: Date | null;
 	}
 
 	// ── State ──────────────────────────────────────────
@@ -138,14 +142,20 @@
 	const zones = $state<ZoneSummary[]>([]);
 	let zonesLoading = $state(false);
 	let zoneQuery = $state('');
+	let zoneListOpen = $state(false);
+	let zoneActiveIndex = $state(0);
 	let selectedZoneId = $state('');
 
 	let activeTab = $state<Tab>('manage');
-	let toast = $state<{ type: 'ok' | 'error'; message: string } | null>(null);
+	let toast = $state<{ id: number; type: 'ok' | 'error'; message: string } | null>(null);
+	let toastSeed = 0;
 	let busy = $state(false);
+	let listLoading = $state(false);
 
 	// Manage tab
 	let mergedSnippets = $state<MergedSnippet[]>([]);
+	let snippetQuery = $state('');
+	let recentName = $state<string | null>(null);
 	let snippetRules = $state<SnippetRule[]>([]);
 	let deleteConfirmName = $state<string | null>(null);
 	let renameTarget = $state<string | null>(null);
@@ -185,34 +195,136 @@
 
 	// ── Derived ────────────────────────────────────────
 
-	function getMatchingZones(query: string): ZoneSummary[] {
-		const normalized = query.trim().toLowerCase();
-		if (!normalized) return zones;
-		return zones.filter((zone) => zone.name.toLowerCase().includes(normalized));
+	function searchTokens(query: string): string[] {
+		return query.trim().toLowerCase().split(/\s+/).filter(Boolean);
 	}
 
-	const filteredZones = $derived(getMatchingZones(zoneQuery));
+	function matchesAll(haystack: string, tokens: string[]): boolean {
+		const lower = haystack.toLowerCase();
+		return tokens.every((t) => lower.includes(t));
+	}
 
-	$effect(() => {
-		if (zonesLoading) return;
-		if (filteredZones.length === 0) return;
-		// If the user already selected a zone that's no longer visible in filtered results, clear it
-		if (selectedZoneId && !filteredZones.some((zone) => zone.id === selectedZoneId)) {
-			selectedZoneId = '';
-		}
-	});
+	function getMatchingZones(query: string): ZoneSummary[] {
+		const tokens = searchTokens(query);
+		if (tokens.length === 0) return zones;
+		const first = tokens[0];
+		const rank = (name: string): number => {
+			const lower = name.toLowerCase();
+			if (lower === first) return 0;
+			if (lower.startsWith(first)) return 1;
+			return 2;
+		};
+		return zones
+			.filter((zone) => matchesAll(zone.name, tokens))
+			.sort((a, b) => rank(a.name) - rank(b.name));
+	}
 
 	const selectedZoneName = $derived(zones.find((z) => z.id === selectedZoneId)?.name ?? '');
 
+	// Showing the full list when the input still holds the selected zone lets users browse after focusing.
+	const effectiveZoneQuery = $derived(zoneQuery === selectedZoneName ? '' : zoneQuery);
+	const filteredZones = $derived(getMatchingZones(effectiveZoneQuery));
+
+	const filteredSnippets = $derived.by(() => {
+		const tokens = searchTokens(snippetQuery);
+		if (tokens.length === 0) return mergedSnippets;
+		return mergedSnippets.filter((m) =>
+			matchesAll(
+				[m.snippet.snippet_name, m.rule?.description ?? '', m.rule?.expression ?? '', m.code].join(
+					'\n'
+				),
+				tokens
+			)
+		);
+	});
+
+	const codePending = $derived(
+		snippetQuery.trim() ? mergedSnippets.filter((m) => !m.codeLoaded).length : 0
+	);
+
+	const editorSearch = $derived.by(() => {
+		const tokens = searchTokens(snippetQuery);
+		if (tokens.length <= 1) return { query: tokens[0] ?? '', regexp: false };
+		return { query: tokens.map(escapeRegExp).join('|'), regexp: true };
+	});
+
+	interface CodeHit {
+		lineNo: number;
+		text: string;
+	}
+
+	const MAX_CODE_HITS = 3;
+
+	function findCodeHits(code: string, query: string): { hits: CodeHit[]; total: number } {
+		const tokens = searchTokens(query);
+		const hits: CodeHit[] = [];
+		let total = 0;
+		if (tokens.length === 0 || !code) return { hits, total };
+		const lines = code.split('\n');
+		for (let i = 0; i < lines.length; i++) {
+			const lower = lines[i].toLowerCase();
+			if (!tokens.some((t) => lower.includes(t))) continue;
+			total += 1;
+			if (hits.length < MAX_CODE_HITS) hits.push({ lineNo: i + 1, text: lines[i].trim() });
+		}
+		return { hits, total };
+	}
+
+	const dirtyCount = $derived(mergedSnippets.filter((m) => isDirty(m)).length);
+
 	const nameValid = $derived(/^[A-Za-z0-9_]+$/.test(newSnippetName));
+	const nameTaken = $derived(
+		mergedSnippets.some((m) => m.snippet.snippet_name === newSnippetName)
+	);
 
 	// ── Helpers ────────────────────────────────────────
 
 	function showToast(type: 'ok' | 'error', message: string): void {
-		toast = { type, message };
-		setTimeout(() => {
-			if (toast?.message === message) toast = null;
-		}, 4500);
+		const id = ++toastSeed;
+		toast = { id, type, message };
+		setTimeout(
+			() => {
+				if (toast?.id === id) toast = null;
+			},
+			type === 'error' ? 9000 : 4000
+		);
+	}
+
+	function ruleKey(rule: SnippetRule | undefined): string {
+		if (!rule) return '';
+		return JSON.stringify({
+			expression: rule.expression,
+			description: rule.description,
+			enabled: rule.enabled
+		});
+	}
+
+	function isDirty(entry: MergedSnippet): boolean {
+		if (entry.codeLoaded && entry.code !== entry.savedCode) return true;
+		return !!entry.rule && ruleKey(entry.rule) !== entry.ruleSnapshot;
+	}
+
+	function savedRuleOf(entry: MergedSnippet): SnippetRule | undefined {
+		if (!entry.rule) return undefined;
+		return { ...entry.rule, ...JSON.parse(entry.ruleSnapshot) };
+	}
+
+	function escapeRegExp(value: string): string {
+		return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+	}
+
+	function highlightMatch(text: string, query: string): string {
+		const tokens = searchTokens(query);
+		if (tokens.length === 0) return escapeHtml(text);
+		const pattern = new RegExp(`(${tokens.map(escapeRegExp).join('|')})`, 'gi');
+		return text
+			.split(pattern)
+			.map((part, i) => (i % 2 === 1 ? `<mark>${escapeHtml(part)}</mark>` : escapeHtml(part)))
+			.join('');
+	}
+
+	function formatTime(date: Date): string {
+		return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 	}
 
 	function escapeHtml(value: string): string {
@@ -271,7 +383,8 @@
 	function initRuleEditorState(name: string, expression: string): void {
 		const scope = detectRuleScope(expression);
 		ruleScopes[name] = scope;
-		expressionViews[name] = 'simple';
+		// Existing expressions can't be parsed back into simple conditions, so show the raw expression.
+		expressionViews[name] = scope === 'custom' ? 'expression' : 'simple';
 		simpleConditionsMap[name] = scope === 'custom' ? [defaultCondition()] : [];
 	}
 
@@ -355,15 +468,30 @@
 		}
 	}
 
+	let loadedZoneId = '';
+
+	function rulesPayload(override?: MergedSnippet, overrideRule?: SnippetRule): SnippetRule[] {
+		return mergedSnippets
+			.filter((m) => m.rule)
+			.map((m) => (m === override && overrideRule ? overrideRule : savedRuleOf(m)!));
+	}
+
 	async function loadSnippetsAndRules(): Promise<void> {
-		if (!selectedZoneId) return;
-		busy = true;
-		mergedSnippets = [];
-		snippetRules = [];
+		const zoneId = selectedZoneId;
+		if (!zoneId) return;
+		const sameZone = zoneId === loadedZoneId;
+		const previous = new Map(
+			(sameZone ? mergedSnippets : []).map((m) => [m.snippet.snippet_name, m])
+		);
+		if (!sameZone) {
+			mergedSnippets = [];
+			snippetQuery = '';
+		}
+		listLoading = mergedSnippets.length === 0;
 		try {
 			const [snippetsRes, rulesRes] = await Promise.all([
-				fetch(`/api/zones/${selectedZoneId}/snippets`),
-				fetch(`/api/zones/${selectedZoneId}/snippets/rules`)
+				fetch(`/api/zones/${zoneId}/snippets`),
+				fetch(`/api/zones/${zoneId}/snippets/rules`)
 			]);
 
 			const snippetsData = (await snippetsRes.json()) as SnippetsResponse;
@@ -371,118 +499,239 @@
 
 			if (!snippetsRes.ok) throw new Error(snippetsData.error || 'Failed to load snippets');
 			if (!rulesRes.ok) throw new Error(rulesData.error || 'Failed to load snippet rules');
+			if (zoneId !== selectedZoneId) return;
 
-			const snippets = snippetsData.snippets ?? [];
+			const snippets = [...(snippetsData.snippets ?? [])].sort((a, b) =>
+				a.snippet_name.localeCompare(b.snippet_name, undefined, { sensitivity: 'base' })
+			);
 			const rules = rulesData.rules ?? [];
 			snippetRules = rules;
 
 			mergedSnippets = snippets.map((snippet) => {
-				const rule = rules.find((r) => r.snippet_name === snippet.snippet_name);
-				if (rule) {
-					initRuleEditorState(snippet.snippet_name, rule.expression);
+				const name = snippet.snippet_name;
+				const prev = previous.get(name);
+				if (prev && isDirty(prev)) {
+					return { ...prev, snippet };
 				}
+				const rule = rules.find((r) => r.snippet_name === name);
+				if (rule) initRuleEditorState(name, rule.expression);
 				return {
 					snippet,
 					rule,
+					ruleSnapshot: ruleKey(rule),
 					code: '',
+					savedCode: '',
 					codeLoaded: false,
-					codeModified: false,
-					expanded: false
+					codeLoading: false,
+					expanded: prev?.expanded ?? false,
+					saving: false,
+					savedAt: prev?.savedAt ?? null
 				};
 			});
+			loadedZoneId = zoneId;
+			allCodeRequested = false;
+			if (searchTokens(snippetQuery).length > 0) loadAllCode();
 
-			showToast('ok', `Loaded ${snippets.length} snippet(s), ${rules.length} rule(s).`);
+			for (const entry of mergedSnippets) {
+				if (entry.expanded && !entry.codeLoaded) loadSnippetCode(entry);
+			}
 		} catch (error) {
 			showToast('error', error instanceof Error ? error.message : 'Failed to load data');
 		} finally {
-			busy = false;
+			listLoading = false;
 		}
 	}
 
-	async function loadSnippetCode(index: number): Promise<void> {
-		const entry = mergedSnippets[index];
-		if (!entry || entry.codeLoaded) return;
-
+	async function loadSnippetCode(entry: MergedSnippet): Promise<void> {
+		if (entry.codeLoaded || entry.codeLoading) return;
+		entry.codeLoading = true;
 		try {
 			const response = await fetch(
 				`/api/zones/${selectedZoneId}/snippets/${entry.snippet.snippet_name}`
 			);
 			const data = (await response.json()) as CodeResponse;
 			if (!response.ok) throw new Error(data.error || 'Failed to load code');
-			mergedSnippets[index].code = data.code;
-			mergedSnippets[index].codeLoaded = true;
+			entry.code = data.code;
+			entry.savedCode = data.code;
+			entry.codeLoaded = true;
 		} catch (error) {
 			showToast('error', error instanceof Error ? error.message : 'Failed to load snippet code');
+		} finally {
+			entry.codeLoading = false;
 		}
 	}
 
-	async function toggleExpand(index: number): Promise<void> {
-		mergedSnippets[index].expanded = !mergedSnippets[index].expanded;
-		if (mergedSnippets[index].expanded && !mergedSnippets[index].codeLoaded) {
-			await loadSnippetCode(index);
+	let allCodeRequested = false;
+
+	async function loadAllCode(): Promise<void> {
+		if (allCodeRequested) return;
+		allCodeRequested = true;
+		const queue = mergedSnippets.filter((m) => !m.codeLoaded && !m.codeLoading);
+		const worker = async () => {
+			for (let next = queue.shift(); next; next = queue.shift()) {
+				await loadSnippetCode(next);
+			}
+		};
+		await Promise.all(Array.from({ length: 4 }, worker));
+	}
+
+	let codeSearchTimer: ReturnType<typeof setTimeout> | undefined;
+
+	$effect(() => {
+		const active = searchTokens(snippetQuery).length > 0 && mergedSnippets.length > 0;
+		clearTimeout(codeSearchTimer);
+		if (active) codeSearchTimer = setTimeout(() => untrack(loadAllCode), 250);
+	});
+
+	async function toggleExpand(entry: MergedSnippet): Promise<void> {
+		entry.expanded = !entry.expanded;
+		if (entry.expanded && !entry.codeLoaded) {
+			await loadSnippetCode(entry);
 		}
 	}
 
-	async function saveSnippet(index: number): Promise<void> {
-		const entry = mergedSnippets[index];
-		if (!entry) return;
-		busy = true;
+	async function saveSnippet(entry: MergedSnippet): Promise<void> {
+		if (entry.saving || !isDirty(entry)) return;
+		const name = entry.snippet.snippet_name;
+		const codeToSave = entry.code;
+		const ruleToSave = entry.rule ? { ...entry.rule } : undefined;
+		const codeChanged = entry.codeLoaded && codeToSave !== entry.savedCode;
+		const ruleChanged = !!ruleToSave && ruleKey(ruleToSave) !== entry.ruleSnapshot;
+		entry.saving = true;
 		try {
-			// Save code
-			const codeRes = await fetch(
-				`/api/zones/${selectedZoneId}/snippets/${entry.snippet.snippet_name}`,
-				{
+			if (codeChanged) {
+				const codeRes = await fetch(`/api/zones/${selectedZoneId}/snippets/${name}`, {
 					method: 'PUT',
 					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ code: entry.code })
+					body: JSON.stringify({ code: codeToSave })
+				});
+				const codeData = (await codeRes.json()) as ApiError;
+				if (!codeRes.ok) throw new Error(codeData.error || 'Could not save code');
+				entry.savedCode = codeToSave;
+				entry.snippet.modified_on = new Date().toISOString();
+			}
+
+			if (ruleChanged) {
+				const rulesToSave = rulesPayload(entry, ruleToSave);
+				const rulesRes = await fetch(`/api/zones/${selectedZoneId}/snippets/rules`, {
+					method: 'PUT',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ rules: rulesToSave })
+				});
+				const rulesData = (await rulesRes.json()) as RulesResponse;
+				if (!rulesRes.ok) {
+					throw new Error(
+						codeChanged
+							? `Code saved, but the rule was not: ${rulesData.error || 'unknown error'}`
+							: rulesData.error || 'Could not save rule'
+					);
 				}
-			);
-			const codeData = (await codeRes.json()) as ApiError;
-			if (!codeRes.ok) throw new Error(codeData.error || 'Failed to save code');
-			mergedSnippets[index].codeModified = false;
+				snippetRules = rulesData.rules ?? rulesToSave;
+				entry.ruleSnapshot = ruleKey(ruleToSave);
+			}
 
-			// Save rules
-			const rulesToSave = mergedSnippets
-				.filter((m) => m.rule)
-				.map((m) => m.rule!);
-
-			const rulesRes = await fetch(`/api/zones/${selectedZoneId}/snippets/rules`, {
-				method: 'PUT',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ rules: rulesToSave })
-			});
-			const rulesData = (await rulesRes.json()) as RulesResponse;
-			if (!rulesRes.ok) throw new Error(rulesData.error || 'Failed to save rules');
-			snippetRules = rulesData.rules ?? rulesToSave;
-
-			showToast('ok', `Snippet "${entry.snippet.snippet_name}" saved.`);
+			entry.savedAt = new Date();
+			showToast('ok', `Saved "${name}" to ${selectedZoneName}.`);
 		} catch (error) {
 			showToast('error', error instanceof Error ? error.message : 'Save failed');
 		} finally {
-			busy = false;
+			entry.saving = false;
 		}
 	}
 
-	async function toggleRuleEnabled(index: number): Promise<void> {
-		const entry = mergedSnippets[index];
-		if (!entry?.rule) return;
-		entry.rule.enabled = !entry.rule.enabled;
+	function discardChanges(entry: MergedSnippet): void {
+		entry.code = entry.savedCode;
+		if (entry.rule) {
+			Object.assign(entry.rule, JSON.parse(entry.ruleSnapshot));
+			initRuleEditorState(entry.snippet.snippet_name, entry.rule.expression);
+		}
+	}
+
+	async function toggleRuleEnabled(entry: MergedSnippet): Promise<void> {
+		if (!entry.rule || entry.saving) return;
+		const name = entry.snippet.snippet_name;
+		const enabled = !entry.rule.enabled;
+		const savedRule = { ...savedRuleOf(entry)!, enabled };
+		entry.rule.enabled = enabled;
+		entry.saving = true;
 		try {
-			const rulesToSave = mergedSnippets
-				.filter((m) => m.rule)
-				.map((m) => m.rule!);
+			const rulesToSave = rulesPayload(entry, savedRule);
 			const res = await fetch(`/api/zones/${selectedZoneId}/snippets/rules`, {
 				method: 'PUT',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ rules: rulesToSave })
 			});
 			const data = (await res.json()) as RulesResponse;
-			if (!res.ok) throw new Error(data.error || 'Failed to update rule');
+			if (!res.ok) throw new Error(data.error || 'Could not update rule');
 			snippetRules = data.rules ?? rulesToSave;
+			entry.ruleSnapshot = ruleKey(savedRule);
+			showToast('ok', `"${name}" ${enabled ? 'enabled' : 'disabled'}.`);
 		} catch (error) {
-			entry.rule.enabled = !entry.rule.enabled;
-			showToast('error', error instanceof Error ? error.message : 'Failed to toggle rule');
+			entry.rule.enabled = !enabled;
+			showToast('error', error instanceof Error ? error.message : 'Could not update rule');
+		} finally {
+			entry.saving = false;
 		}
+	}
+
+	function selectZone(zone: ZoneSummary): void {
+		zoneListOpen = false;
+		if (zone.id === selectedZoneId) {
+			zoneQuery = zone.name;
+			return;
+		}
+		if (dirtyCount > 0 && !confirm(`Discard unsaved changes in ${dirtyCount} snippet(s)?`)) {
+			zoneQuery = selectedZoneName;
+			return;
+		}
+		selectedZoneId = zone.id;
+		zoneQuery = zone.name;
+	}
+
+	function closeZoneList(): void {
+		zoneListOpen = false;
+		zoneQuery = selectedZoneName;
+	}
+
+	function onZoneKeydown(event: KeyboardEvent): void {
+		const count = filteredZones.length;
+		if (event.key === 'ArrowDown') {
+			event.preventDefault();
+			zoneListOpen = true;
+			if (count) zoneActiveIndex = (zoneActiveIndex + 1) % count;
+		} else if (event.key === 'ArrowUp') {
+			event.preventDefault();
+			zoneListOpen = true;
+			if (count) zoneActiveIndex = (zoneActiveIndex - 1 + count) % count;
+		} else if (event.key === 'Enter') {
+			const zone = filteredZones[zoneActiveIndex];
+			if (zoneListOpen && zone) {
+				event.preventDefault();
+				selectZone(zone);
+			}
+		} else if (event.key === 'Escape') {
+			closeZoneList();
+		}
+	}
+
+	$effect(() => {
+		if (!zoneListOpen) return;
+		document
+			.getElementById(`zone-opt-${zoneActiveIndex}`)
+			?.scrollIntoView({ block: 'nearest' });
+	});
+
+	function onWindowKeydown(event: KeyboardEvent): void {
+		if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 's') return;
+		const host = (event.target as HTMLElement | null)?.closest<HTMLElement>('[data-snippet]');
+		if (!host) return;
+		event.preventDefault();
+		const entry = mergedSnippets.find((m) => m.snippet.snippet_name === host.dataset.snippet);
+		if (entry) saveSnippet(entry);
+	}
+
+	function onBeforeUnload(event: BeforeUnloadEvent): void {
+		if (dirtyCount > 0) event.preventDefault();
 	}
 
 	function requestDelete(name: string): void {
@@ -551,6 +800,7 @@
 
 	async function deployNewSnippet(): Promise<void> {
 		nameError = validateSnippetName(newSnippetName);
+		if (!nameError && nameTaken) nameError = 'A snippet with this name already exists in this zone.';
 		if (nameError) return;
 		if (!newSnippetCode.trim()) {
 			showToast('error', 'Snippet code is required.');
@@ -590,7 +840,8 @@
 				if (!rulesRes.ok) throw new Error(rulesData.error || 'Snippet created but rule failed');
 			}
 
-			showToast('ok', `Snippet "${newSnippetName}" deployed.`);
+			showToast('ok', `Deployed "${newSnippetName}" to ${selectedZoneName}.`);
+			const deployedName = newSnippetName;
 			newSnippetName = '';
 			newSnippetCode = `export default {
   async fetch(request) {
@@ -608,11 +859,26 @@
 			nameError = '';
 			activeTab = 'manage';
 			await loadSnippetsAndRules();
+			await revealSnippet(deployedName);
 		} catch (error) {
 			showToast('error', error instanceof Error ? error.message : 'Deploy failed');
 		} finally {
 			busy = false;
 		}
+	}
+
+	async function revealSnippet(name: string): Promise<void> {
+		const entry = mergedSnippets.find((m) => m.snippet.snippet_name === name);
+		if (!entry) return;
+		snippetQuery = '';
+		recentName = name;
+		setTimeout(() => {
+			if (recentName === name) recentName = null;
+		}, 2500);
+		await tick();
+		document
+			.querySelector(`[data-snippet-row="${CSS.escape(name)}"]`)
+			?.scrollIntoView({ block: 'center', behavior: 'smooth' });
 	}
 
 	// ── Import / Export ────────────────────────────────
@@ -625,10 +891,8 @@
 		busy = true;
 		try {
 			// Ensure all code is loaded
-			for (let i = 0; i < mergedSnippets.length; i++) {
-				if (!mergedSnippets[i].codeLoaded) {
-					await loadSnippetCode(i);
-				}
+			for (const entry of mergedSnippets) {
+				if (!entry.codeLoaded) await loadSnippetCode(entry);
 			}
 
 			const payload: EmberExportPayload = {
@@ -664,9 +928,8 @@
 		}
 	}
 
-	function exportSingleSnippet(index: number): void {
-		const entry = mergedSnippets[index];
-		if (!entry || !entry.codeLoaded) return;
+	function exportSingleSnippet(entry: MergedSnippet): void {
+		if (!entry.codeLoaded) return;
 
 		const blob = new Blob([entry.code], { type: 'application/javascript' });
 		const url = URL.createObjectURL(blob);
@@ -774,33 +1037,54 @@
 
 	$effect(() => {
 		if (selectedZoneId) {
-			loadSnippetsAndRules();
+			untrack(() => loadSnippetsAndRules());
 		}
 	});
 </script>
 
+<svelte:window onkeydown={onWindowKeydown} onbeforeunload={onBeforeUnload} />
+
 <!-- ─── Zone Picker ─────────────────────────────────── -->
-<div class="panel stack">
-	<div class="grid-2">
-		<div class="stack" style="gap: 0.3rem;">
-			<label class="muted" for="zone-query">Search Zones</label>
-			<input
-				id="zone-query"
-				class="input"
-				type="text"
-				placeholder="Filter zones…"
-				bind:value={zoneQuery}
-			/>
-		</div>
-		<div class="stack" style="gap: 0.3rem;">
-			<label class="muted" for="zone-select">Zone</label>
-			<select id="zone-select" class="select" bind:value={selectedZoneId}>
-				<option value="" disabled>Select a zone…</option>
-				{#each filteredZones as zone (zone.id)}
-					<option value={zone.id}>{zone.name}</option>
+<div class="panel zone-picker">
+	<label class="muted" for="zone-search">Zone</label>
+	<div class="combobox">
+		<input
+			id="zone-search"
+			class="input"
+			type="text"
+			role="combobox"
+			autocomplete="off"
+			spellcheck="false"
+			aria-expanded={zoneListOpen}
+			aria-controls="zone-listbox"
+			aria-autocomplete="list"
+			aria-activedescendant={zoneListOpen && filteredZones.length ? `zone-opt-${zoneActiveIndex}` : undefined}
+			placeholder={zonesLoading ? 'Loading zones…' : `Search ${zones.length} zones`}
+			disabled={zonesLoading}
+			bind:value={zoneQuery}
+			onfocus={(e) => { e.currentTarget.select(); zoneListOpen = true; zoneActiveIndex = 0; }}
+			oninput={() => { zoneListOpen = true; zoneActiveIndex = 0; }}
+			onkeydown={onZoneKeydown}
+			onblur={closeZoneList}
+		/>
+		{#if zoneListOpen && !zonesLoading}
+			<ul id="zone-listbox" class="combobox-list" role="listbox" aria-label="Zones">
+				{#each filteredZones as zone, zi (zone.id)}
+					<li
+						id="zone-opt-{zi}"
+						role="option"
+						aria-selected={zone.id === selectedZoneId}
+						class:active={zi === zoneActiveIndex}
+						onmousedown={(e) => { e.preventDefault(); selectZone(zone); }}
+						onmousemove={() => (zoneActiveIndex = zi)}
+					>
+						{@html highlightMatch(zone.name, effectiveZoneQuery)}
+					</li>
+				{:else}
+					<li class="combobox-empty">No zones match "{zoneQuery.trim()}"</li>
 				{/each}
-			</select>
-		</div>
+			</ul>
+		{/if}
 	</div>
 </div>
 
@@ -833,8 +1117,8 @@
 
 	<!-- ─── Manage Tab ──────────────────────────────── -->
 	{#if activeTab === 'manage'}
-		{#if busy}
-			<div class="skeleton-table">
+		{#if listLoading}
+			<div class="skeleton-table" aria-busy="true" aria-label="Loading snippets">
 				<div class="skeleton-row skeleton-header">
 					<div class="skeleton-cell" style="width: 24%;"></div>
 					<div class="skeleton-cell" style="width: 30%;"></div>
@@ -855,12 +1139,39 @@
 		{:else if mergedSnippets.length === 0}
 			<p class="muted" style="text-align: center; padding: 1.5rem 0;">
 				{#if selectedZoneId}
-					No snippets found for this zone.
+					No snippets in {selectedZoneName} yet.
+					<button class="link-button" onclick={() => (activeTab = 'create')}>Create one</button>
 				{:else}
-					Select a zone to view snippets.
+					Pick a zone to see its snippets.
 				{/if}
 			</p>
 		{:else}
+			<div class="list-toolbar">
+				<input
+					class="input"
+					type="search"
+					placeholder="Search names, rules, and code"
+					aria-label="Search snippets"
+					bind:value={snippetQuery}
+					onkeydown={(e) => { if (e.key === 'Escape') snippetQuery = ''; }}
+				/>
+				<span class="muted" aria-live="polite">
+					{#if snippetQuery.trim()}
+						{filteredSnippets.length} of {mergedSnippets.length}{#if codePending > 0}, searching code ({mergedSnippets.length - codePending}/{mergedSnippets.length}){/if}
+					{:else}
+						{mergedSnippets.length} snippet{mergedSnippets.length === 1 ? '' : 's'}
+					{/if}{#if dirtyCount > 0}<span class="unsaved-count">, {dirtyCount} unsaved</span>{/if}
+				</span>
+				<button class="button secondary" disabled={listLoading} onclick={loadSnippetsAndRules}>
+					Refresh
+				</button>
+			</div>
+			{#if filteredSnippets.length === 0}
+				<p class="muted" style="text-align: center; padding: 1.5rem 0;">
+					No snippets match "{snippetQuery.trim()}".
+					<button class="link-button" onclick={() => (snippetQuery = '')}>Clear filter</button>
+				</p>
+			{:else}
 			<div style="overflow-x: auto;">
 			<table>
 				<thead>
@@ -873,12 +1184,30 @@
 					</tr>
 				</thead>
 				<tbody>
-					{#each mergedSnippets as entry, i (entry.snippet.snippet_name)}
+					{#each filteredSnippets as entry (entry.snippet.snippet_name)}
+						{@const dirty = isDirty(entry)}
 						<tr
-							style="cursor: pointer;"
-							onclick={() => toggleExpand(i)}
+							class="snippet-row"
+							class:expanded={entry.expanded}
+							class:recent={recentName === entry.snippet.snippet_name}
+							data-snippet-row={entry.snippet.snippet_name}
+							onclick={() => toggleExpand(entry)}
 						>
-							<td style="font-weight: 600;">{entry.snippet.snippet_name}</td>
+							<td>
+								<button
+									class="row-toggle"
+									aria-expanded={entry.expanded}
+									onclick={(e) => { e.stopPropagation(); toggleExpand(entry); }}
+								>
+									<span class="chevron" aria-hidden="true">{entry.expanded ? '▾' : '▸'}</span>
+									<span class="row-name">{@html highlightMatch(entry.snippet.snippet_name, snippetQuery)}</span>
+								</button>
+								{#if entry.saving}
+									<span class="pill saving">Saving…</span>
+								{:else if dirty}
+									<span class="pill unsaved">Unsaved</span>
+								{/if}
+							</td>
 							<td>
 								{#if entry.rule}
 									{#if entry.rule.expression.trim() === 'true'}
@@ -900,8 +1229,10 @@
 									<label class="toggle" onclick={(e) => e.stopPropagation()}>
 										<input
 											type="checkbox"
+											aria-label="Enable {entry.snippet.snippet_name}"
 											checked={entry.rule.enabled}
-											onchange={() => toggleRuleEnabled(i)}
+											disabled={entry.saving}
+											onchange={() => toggleRuleEnabled(entry)}
 										/>
 										<span class="toggle-slider"></span>
 									</label>
@@ -916,7 +1247,8 @@
 										<button
 											class="button secondary"
 											style="font-size: 0.68rem; padding: 0.25rem 0.45rem;"
-											onclick={(e) => { e.stopPropagation(); exportSingleSnippet(i); }}
+											title="Download as .js"
+											onclick={(e) => { e.stopPropagation(); exportSingleSnippet(entry); }}
 										>
 											.js
 										</button>
@@ -932,9 +1264,30 @@
 							</td>
 						</tr>
 
+						{#if !entry.expanded && snippetQuery.trim()}
+							{@const found = findCodeHits(entry.code, snippetQuery)}
+							{#if found.total > 0}
+								<tr class="code-hits" onclick={() => toggleExpand(entry)}>
+									<td colspan="5">
+										{#each found.hits as hit (hit.lineNo)}
+											<div class="code-hit">
+												<span class="code-hit-line">{hit.lineNo}</span>
+												<code>{@html highlightMatch(hit.text, snippetQuery)}</code>
+											</div>
+										{/each}
+										{#if found.total > found.hits.length}
+											<div class="muted code-hit-more">
+												{found.total - found.hits.length} more matching line{found.total - found.hits.length === 1 ? '' : 's'}
+											</div>
+										{/if}
+									</td>
+								</tr>
+							{/if}
+						{/if}
+
 						{#if entry.expanded}
-							<tr>
-								<td colspan="5" style="padding: 0.5rem;">
+							<tr class="snippet-detail">
+								<td colspan="5" style="padding: 0.5rem;" data-snippet={entry.snippet.snippet_name}>
 									{#if !entry.codeLoaded}
 										<p class="muted">Loading code…</p>
 									{:else}
@@ -942,10 +1295,9 @@
 											<CodeEditor
 												code={entry.code}
 												minHeight="180px"
-												onchange={(val) => {
-													mergedSnippets[i].code = val;
-													mergedSnippets[i].codeModified = true;
-												}}
+												searchQuery={editorSearch.query}
+												searchRegexp={editorSearch.regexp}
+												onchange={(val) => (entry.code = val)}
 											/>
 
 											{#if entry.rule}
@@ -1098,14 +1450,33 @@
 												</p>
 											{/if}
 
-											<div class="row">
+											<div class="save-bar" class:dirty>
 												<button
-													class="button save"
-													disabled={busy}
-													onclick={() => saveSnippet(i)}
+													class="button"
+													class:secondary={!dirty}
+													disabled={!dirty || entry.saving}
+													title="Save (Ctrl+S)"
+													aria-keyshortcuts="Control+S Meta+S"
+													onclick={() => saveSnippet(entry)}
 												>
-													Save
+													{entry.saving ? 'Saving…' : 'Save changes'}
 												</button>
+												{#if dirty && !entry.saving}
+													<button class="button secondary" onclick={() => discardChanges(entry)}>
+														Discard
+													</button>
+												{/if}
+												<span class="save-state" role="status">
+													{#if entry.saving}
+														Saving to {selectedZoneName}…
+													{:else if dirty}
+														Unsaved changes
+													{:else if entry.savedAt}
+														<span class="saved-ok">Saved at {formatTime(entry.savedAt)}</span>
+													{:else}
+														No changes
+													{/if}
+												</span>
 											</div>
 										</div>
 									{/if}
@@ -1116,12 +1487,7 @@
 				</tbody>
 			</table>
 			</div>
-
-			<div class="row" style="margin-top: 0.55rem;">
-				<button class="button secondary" disabled={busy} onclick={loadSnippetsAndRules}>
-					Refresh
-				</button>
-			</div>
+			{/if}
 		{/if}
 
 	<!-- ─── Create Tab ──────────────────────────────── -->
@@ -1136,10 +1502,12 @@
 						type="text"
 						placeholder="my_snippet"
 						bind:value={newSnippetName}
-						oninput={() => (nameError = validateSnippetName(newSnippetName))}
+						aria-invalid={!!nameError}
+						aria-describedby={nameError ? 'snippet-name-error' : undefined}
+						oninput={() => (nameError = validateSnippetName(newSnippetName) || (nameTaken ? 'A snippet with this name already exists in this zone.' : ''))}
 					/>
 					{#if nameError}
-						<span style="color: var(--danger); font-size: 0.72rem;">{nameError}</span>
+						<span id="snippet-name-error" style="color: var(--danger); font-size: 0.72rem;">{nameError}</span>
 					{/if}
 				</div>
 			</div>
@@ -1317,10 +1685,10 @@
 			<div class="row" style="margin-top: 0.3rem;">
 				<button
 					class="button"
-					disabled={busy || !nameValid || !newSnippetCode.trim()}
+					disabled={busy || !selectedZoneId || !nameValid || nameTaken || !newSnippetCode.trim()}
 					onclick={deployNewSnippet}
 				>
-					Deploy Snippet
+					{busy ? 'Deploying…' : selectedZoneName ? `Deploy to ${selectedZoneName}` : 'Pick a zone to deploy'}
 				</button>
 			</div>
 		</div>
@@ -1348,7 +1716,7 @@
 						Cancel
 					</button>
 					<button class="button danger" disabled={busy} onclick={confirmDelete}>
-						Delete
+						{busy ? 'Deleting…' : 'Delete'}
 					</button>
 				</div>
 			</div>
@@ -1488,10 +1856,15 @@
 {/if}
 
 <!-- ─── Toast ───────────────────────────────────────── -->
-{#if toast}
-	<div class="toast">
-		<div class="status" class:ok={toast.type === 'ok'} class:error={toast.type === 'error'}>
-			{toast.message}
+<div class="toast" aria-live="polite">
+	{#if toast}
+		<div
+			class="status"
+			class:ok={toast.type === 'ok'}
+			class:error={toast.type === 'error'}
+		>
+			<span>{toast.message}</span>
+			<button class="toast-close" aria-label="Dismiss" onclick={() => (toast = null)}>✕</button>
 		</div>
-	</div>
-{/if}
+	{/if}
+</div>
